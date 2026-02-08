@@ -1,4 +1,4 @@
-# To do in order to get project working in order  
+# To-Do Project Startup 
 OS:Windows  
 IDE: VSCode  
 Hardware: OAK-DS-2  
