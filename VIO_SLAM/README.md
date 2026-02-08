@@ -1,9 +1,15 @@
-To do in order to get project working in order  
-Using: Windows, Visual Studio Code & Python  , OAk DS-2 
+# To do in order to get project working in order  
+OS:Windows  
+IDE: VSCode  
+Hardware: OAK-DS-2  
+Language: Pyhton  
+
+
 
 Recommended Code order: test_vio_simple.py, vio_with_rgb.py, logging_VIO_only.py, plot_from_csv.py, Logging_VIO_SLAM_.py
 
-1) Install Python, I am using version 3.12.10. It needs to be either python 3.12 or 3.11, spectacularAI is not supported in 3.13 or 3.14 at time of making this project. https://www.python.org/downloads/windows/   
+1) Install Python, I am using version 3.12.10. It needs to be either python 3.12 or 3.11, spectacularAI is not supported in 3.13 or 3.14 at time of making this project. https://www.python.org/downloads/windows/  
+When installing ensure that you check the box that says include Python in Path 
 2) Enable Python extensions in VSCode. (Pylance, Python, Python debugger, Python Environments Optional: Python Extension Pack and Python Path)
 3) Create folder in file explorer that you are going to be using
 4) Open Folder from file tab in VSCode then navigate to your folder and open. It should be empty currently
