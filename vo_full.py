@@ -81,7 +81,7 @@ MAX_CORR_STEP_M = 1.0
 # -----------------------
 # MAVLink / ODOMETRY SETTINGS
 # -----------------------
-ENABLE_MAVLINK_ODOM = False
+ENABLE_MAVLINK_ODOM = True
 
 # For Pi GPIO UART, common device is /dev/serial0 (recommended symlink)
 # If you already use another port, change it accordingly.
