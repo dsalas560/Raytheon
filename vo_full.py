@@ -1,26 +1,23 @@
 """
-vo_depthai_lk_loop_softcorr_fast_RGB_MAIN_odometry.py  (DepthAI v2.x, NO SpectacularAI)
+vo_full.py  (DepthAI v2.x, NO SpectacularAI) — MAVLink VISION_POSITION_ESTIMATE (ArduCopter ExternalNav)
 
-Adds MAVLink ODOMETRY output (ExternalNav aid for ArduCopter EKF3).
+This is your original VO + loop closure + soft correction script, updated to send
+MAVLink VISION_POSITION_ESTIMATE instead of ODOMETRY (since your pymavlink build
+does not expose odometry_send()).
 
-Assumptions / mapping (important):
-- Your VO coordinate frame (from your solvePnP pipeline) is effectively aligned with the camera frame at startup:
-    X_vo = right
-    Y_vo = down
-    Z_vo = forward
-- We map to LOCAL_NED as:
-    N = Z_vo
-    E = X_vo
-    D = Y_vo
+What it sends to Pixhawk:
+- VISION_POSITION_ESTIMATE at ~ODOM_RATE_HZ when VO status == "TRACKING"
+- Position: converted into LOCAL NED (x=N, y=E, z=D) from VO frame
+- Orientation: yaw only (roll=pitch=0) unless you choose to add roll/pitch later
 
-Then we apply a one-time yaw alignment using Pixhawk yaw to rotate (N,E) into Pixhawk's heading frame.
-
-This is Architecture 1:
-- Pixhawk handles attitude/yaw with its own IMU/EKF.
-- Pi supplies external position (and derived velocity) via MAVLink ODOMETRY.
+Run tip (recommended):
+  MAVLINK_DIALECT=ardupilotmega python3 vo_full.py
 
 Controls:
 - Press 'q' to quit
+
+Units:
+- METERS for position
 """
 
 import time
@@ -31,6 +28,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 import depthai as dai
+
 
 # -----------------------
 # Settings
@@ -79,22 +77,16 @@ MIN_DRIFT_TO_CORRECT_M = 0.20
 MAX_CORR_STEP_M = 1.0
 
 # -----------------------
-# MAVLink / ODOMETRY SETTINGS
+# MAVLink (VISION_POSITION_ESTIMATE)
 # -----------------------
-ENABLE_MAVLINK_ODOM = True
+ENABLE_MAVLINK_VISION = True
 
-# For Pi GPIO UART, common device is /dev/serial0 (recommended symlink)
-# If you already use another port, change it accordingly.
+# Pi GPIO UART typically uses /dev/serial0
 MAVLINK_DEVICE = "/dev/serial0"
 MAVLINK_BAUD = 921600
 
-# Send odometry at (approx) camera rate. If your loop runs slower, it will naturally send slower.
-ODOM_RATE_HZ = 30.0
-
-# Covariance tuning (conservative defaults)
-POS_STD_M = 0.10          # position std dev (meters)
-VEL_STD_MPS = 0.25        # velocity std dev (m/s)
-YAW_STD_DEG = 30.0        # yaw std dev (degrees) - we don't trust VO yaw strongly here
+# Send vision estimates at (approx) camera rate
+VISION_RATE_HZ = 30.0
 
 
 # -----------------------
@@ -124,15 +116,6 @@ def clamp_norm(vec: np.ndarray, max_norm: float) -> np.ndarray:
     return vec * (max_norm / n)
 
 
-def yaw_rad_to_quat_wxyz(yaw_rad: float) -> tuple[float, float, float, float]:
-    """
-    Quaternion for yaw-only rotation about +Z (Down axis in NED), assuming roll=pitch=0.
-    Returns (w, x, y, z) as MAVLink expects for ODOMETRY q[].
-    """
-    half = 0.5 * yaw_rad
-    return (math.cos(half), 0.0, 0.0, math.sin(half))
-
-
 def rot2d(theta: float) -> np.ndarray:
     c, s = math.cos(theta), math.sin(theta)
     return np.array([[c, -s],
@@ -140,18 +123,24 @@ def rot2d(theta: float) -> np.ndarray:
 
 
 # -----------------------
-# MAVLink ODOMETRY Publisher
+# MAVLink VISION_POSITION_ESTIMATE publisher
 # -----------------------
-class MavlinkOdomPublisher:
+class MavlinkVisionPublisher:
     """
-    Publishes MAVLink ODOMETRY to Pixhawk over serial.
+    Publishes MAVLink VISION_POSITION_ESTIMATE to Pixhawk over serial.
 
-    - Learns Pixhawk yaw from ATTITUDE and aligns VO frame to Pixhawk heading once.
-    - Publishes pose in LOCAL_NED.
-    - Provides derived velocity in LOCAL_NED.
+    Key points:
+    - We map VO pose (x=right, y=down, z=forward) -> LOCAL NED (N,E,D) as:
+        N = Z_vo
+        E = X_vo
+        D = Y_vo
+
+    - We apply an initial yaw alignment using Pixhawk ATTITUDE yaw so that
+      our N/E axes line up with Pixhawk's heading frame at startup.
     """
+
     def __init__(self, device: str, baud: int):
-        self.enabled = ENABLE_MAVLINK_ODOM
+        self.enabled = ENABLE_MAVLINK_VISION
 
         self.master = None
         self.boot_wall = None
@@ -161,17 +150,10 @@ class MavlinkOdomPublisher:
 
         self.have_alignment = False
         self.vo_yaw0_rad = None
-        self.yaw_offset_rad = 0.0  # rotate (N,E) by this to align
+        self.yaw_offset_rad = 0.0  # rotate N/E by this to align frames
 
         self.last_send_wall = 0.0
-        self.send_period = 1.0 / max(1e-3, ODOM_RATE_HZ)
-
-        self.prev_pos_ned = None
-        self.prev_pos_wall = None
-        self.vel_ned = np.zeros(3, dtype=np.float64)
-
-        # Low-pass velocity (simple)
-        self.vel_alpha = 0.25
+        self.send_period = 1.0 / max(1e-3, VISION_RATE_HZ)
 
         if not self.enabled:
             return
@@ -179,8 +161,8 @@ class MavlinkOdomPublisher:
         try:
             from pymavlink import mavutil
         except Exception as e:
-            print("\n[WARN] pymavlink not installed or failed to import.")
-            print("Install with: python3 -m pip install --upgrade pymavlink")
+            print("\n[WARN] pymavlink not available.")
+            print("Install in your venv:  pip install pymavlink pyserial")
             print(f"Error: {e}\n")
             self.enabled = False
             return
@@ -190,8 +172,7 @@ class MavlinkOdomPublisher:
         print(f"[MAVLink] Connecting on {device} @ {baud} ...")
         self.master.wait_heartbeat(timeout=10)
         self.boot_wall = time.time()
-        hb = self.master.recv_match(type="HEARTBEAT", blocking=False)
-        print("[MAVLink] Heartbeat OK. Ready to send ODOMETRY.")
+        print("[MAVLink] Heartbeat OK. Ready to send VISION_POSITION_ESTIMATE.")
 
     def _time_usec(self) -> int:
         if self.boot_wall is None:
@@ -199,29 +180,23 @@ class MavlinkOdomPublisher:
         return int((time.time() - self.boot_wall) * 1e6)
 
     def poll_attitude_yaw(self):
-        """
-        Non-blocking fetch of ATTITUDE to capture Pixhawk yaw for alignment.
-        """
+        """Non-blocking grab of Pixhawk yaw (radians) from ATTITUDE."""
         if not self.enabled or self.master is None:
             return
-
         msg = self.master.recv_match(type="ATTITUDE", blocking=False)
         if msg is None:
             return
-
-        # msg.yaw is radians in [-pi,pi]
         self.have_att_yaw = True
         if self.pix_yaw0_rad is None:
             self.pix_yaw0_rad = float(msg.yaw)
 
     def align_if_needed(self, vo_yaw_vis_deg: float):
         """
-        Do one-time yaw alignment:
+        One-time yaw alignment:
           yaw_offset = pixhawk_yaw0 - vo_yaw0
+        Then we rotate our (N,E) by yaw_offset.
         """
-        if not self.enabled:
-            return
-        if self.have_alignment:
+        if not self.enabled or self.have_alignment:
             return
         if not self.have_att_yaw or self.pix_yaw0_rad is None:
             return
@@ -233,15 +208,13 @@ class MavlinkOdomPublisher:
 
     def vo_pose_to_ned(self, pos_vo: np.ndarray) -> np.ndarray:
         """
-        Map VO pose (x=right, y=down, z=forward) -> NED (N,E,D).
-        Apply yaw_offset rotation in horizontal plane (N,E).
+        VO pose -> NED:
+          N = Z_vo, E = X_vo, D = Y_vo
+        then rotate (N,E) by yaw_offset to align to Pixhawk.
         """
         x_vo, y_vo, z_vo = float(pos_vo[0]), float(pos_vo[1]), float(pos_vo[2])
-
-        # base mapping: N=z, E=x, D=y
         ned = np.array([z_vo, x_vo, y_vo], dtype=np.float64)
 
-        # rotate (N,E) by yaw_offset to align with Pixhawk heading at start
         if self.have_alignment:
             R = rot2d(self.yaw_offset_rad)
             ne = R @ ned[:2]
@@ -249,30 +222,9 @@ class MavlinkOdomPublisher:
 
         return ned
 
-    def update_velocity(self, pos_ned: np.ndarray, now_wall: float):
-        if self.prev_pos_ned is None or self.prev_pos_wall is None:
-            self.prev_pos_ned = pos_ned.copy()
-            self.prev_pos_wall = now_wall
-            self.vel_ned[:] = 0.0
-            return
-
-        dt = now_wall - self.prev_pos_wall
-        if dt <= 1e-3 or dt > 0.5:
-            # bad dt; reset
-            self.prev_pos_ned = pos_ned.copy()
-            self.prev_pos_wall = now_wall
-            self.vel_ned[:] = 0.0
-            return
-
-        v_inst = (pos_ned - self.prev_pos_ned) / dt
-        self.vel_ned = (1.0 - self.vel_alpha) * self.vel_ned + self.vel_alpha * v_inst
-
-        self.prev_pos_ned = pos_ned.copy()
-        self.prev_pos_wall = now_wall
-
-    def send_odometry(self, pos_vo: np.ndarray, vo_yaw_vis_deg: float):
+    def send_vision(self, pos_vo: np.ndarray, vo_yaw_vis_deg: float):
         """
-        Send MAVLink ODOMETRY message.
+        Send VISION_POSITION_ESTIMATE when allowed by rate limit.
         """
         if not self.enabled or self.master is None:
             return
@@ -282,68 +234,32 @@ class MavlinkOdomPublisher:
             return
         self.last_send_wall = now
 
-        # Keep polling ATTITUDE so yaw0 can be acquired early.
+        # Keep polling ATTITUDE so yaw0 is learned early
         self.poll_attitude_yaw()
-
-        # One-time yaw alignment (uses Pixhawk yaw + VO yaw at start).
         self.align_if_needed(vo_yaw_vis_deg)
 
         pos_ned = self.vo_pose_to_ned(pos_vo)
-        self.update_velocity(pos_ned, now)
 
-        # For ODOMETRY orientation:
-        # We will send yaw from Pixhawk if available, otherwise 0.
-        yaw_rad = float(self.pix_yaw0_rad) if (self.pix_yaw0_rad is not None) else 0.0
-        q_wxyz = yaw_rad_to_quat_wxyz(yaw_rad)
+        # Orientation to send:
+        # For Architecture 1, Pixhawk already has best roll/pitch/yaw from its IMU/EKF.
+        # VISION_POSITION_ESTIMATE includes roll/pitch/yaw; sending noisy roll/pitch can hurt.
+        # So we send roll=pitch=0 and yaw from Pixhawk if available (otherwise use VO yaw).
+        roll = 0.0
+        pitch = 0.0
+        yaw = float(self.pix_yaw0_rad) if (self.pix_yaw0_rad is not None) else math.radians(float(vo_yaw_vis_deg))
 
-        # Covariances: MAVLink expects 21-element upper triangular for pose and velocity
-        # We'll set position variance, orientation variance large.
-        pos_var = POS_STD_M * POS_STD_M
-        yaw_var = math.radians(YAW_STD_DEG) ** 2
-        vel_var = VEL_STD_MPS * VEL_STD_MPS
-
-        pose_cov = [0.0] * 21
-        vel_cov = [0.0] * 21
-
-        # pose_cov indices correspond to upper triangular of 6x6:
-        # (x,y,z,roll,pitch,yaw). We only fill diagonals for simplicity.
-        # Diagonal positions in the 21-array: 0,6,11,15,18,20
-        pose_cov[0]  = pos_var  # x
-        pose_cov[6]  = pos_var  # y
-        pose_cov[11] = pos_var  # z
-        pose_cov[15] = 10.0     # roll (very uncertain)
-        pose_cov[18] = 10.0     # pitch (very uncertain)
-        pose_cov[20] = yaw_var  # yaw
-
-        vel_cov[0]  = vel_var
-        vel_cov[6]  = vel_var
-        vel_cov[11] = vel_var
-        vel_cov[15] = 10.0
-        vel_cov[18] = 10.0
-        vel_cov[20] = 10.0
-
-        # Frames:
-        # - frame_id: LOCAL_NED (pose in NED)
-        # - child_frame_id: BODY_FRD (optional, but common for vehicle body)
-        frame_id = self.mavutil.mavlink.MAV_FRAME_LOCAL_NED
-        child_id = self.mavutil.mavlink.MAV_FRAME_BODY_FRD
-
-        self.master.mav.odometry_send(
-            self._time_usec(),        # time_usec
-            frame_id,                 # frame_id
-            child_id,                 # child_frame_id
-            pos_ned[0], pos_ned[1], pos_ned[2],   # x,y,z (NED)
-            q_wxyz,                   # q (w,x,y,z)
-            self.vel_ned[0], self.vel_ned[1], self.vel_ned[2],  # vx,vy,vz
-            0.0, 0.0, 0.0,           # rollspeed, pitchspeed, yawspeed (unused)
-            pose_cov,                 # pose_covariance[21]
-            vel_cov,                  # velocity_covariance[21]
-            0                         # reset_counter
+        # MAVLink message:
+        # vision_position_estimate_send(time_usec, x, y, z, roll, pitch, yaw)
+        # Frame expectation: LOCAL_NED-ish (ArduPilot consumes as external vision position)
+        self.master.mav.vision_position_estimate_send(
+            self._time_usec(),
+            float(pos_ned[0]), float(pos_ned[1]), float(pos_ned[2]),
+            float(roll), float(pitch), float(yaw)
         )
 
 
 # -----------------------
-# DepthAI Pipeline (v2 API)
+# DepthAI Pipeline
 # -----------------------
 def build_pipeline() -> dai.Pipeline:
     p = dai.Pipeline()
@@ -396,7 +312,7 @@ def build_pipeline() -> dai.Pipeline:
 
 
 # -----------------------
-# Loop Closure (fast + bounded) — now accepts RGB or Gray
+# Loop Closure ORB (fast)
 # -----------------------
 class LoopClosureORB:
     def __init__(self):
@@ -495,12 +411,13 @@ class LoopClosureORB:
 
 
 # -----------------------
-# VO with LK + PnP + optional soft correction
+# VO with LK + PnP
 # -----------------------
 class VO_LK:
     def __init__(self, K: np.ndarray):
         self.K = K.astype(np.float64)
         self.dist = np.zeros((4, 1), dtype=np.float64)
+
         self.T_w_c = np.eye(4, dtype=np.float64)
 
         self.prev_gray = None
@@ -635,6 +552,7 @@ class VO_LK:
         R, _ = cv2.Rodrigues(rvec)
         t = tvec.reshape(3, 1)
 
+        # Invert (OpenCV convention) to get motion of camera
         R_inv = R.T
         t_inv = -R_inv @ t
 
@@ -695,10 +613,10 @@ def main():
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     csv_path = f"vo_depthai_lk_loop_softcorr_fast_{run_label}_{stamp}.csv"
 
-    print("\nDepthAI VO (StereoDepth + OpenCV LK) + Fast Loop + Soft Correction (RGB MAIN) + MAVLink ODOMETRY")
+    print("\nDepthAI VO (StereoDepth + OpenCV LK) + Fast Loop + Soft Correction (RGB MAIN) + MAVLink VISION_POSITION_ESTIMATE")
     print("Units: METERS (internally + CSV + overlay).")
     print(f"CSV: {csv_path}")
-    if ENABLE_MAVLINK_ODOM:
+    if ENABLE_MAVLINK_VISION:
         print(f"MAVLink: {MAVLINK_DEVICE} @ {MAVLINK_BAUD} (TELEM2/SERIAL2)\n")
     else:
         print("MAVLink: DISABLED\n")
@@ -710,15 +628,16 @@ def main():
         w.writerow([
             "wall_time_iso", "t_sec", "status",
             "x_m", "y_m", "z_m",
-            "yaw_vis_deg", "yaw_imu_deg",
+            "yaw_vis_deg", "yaw_oak_imu_deg",
             "tracked_pts", "pnp_pts", "inliers",
             "loop_detected", "loop_kf_id", "loop_score", "loop_drift_m",
-            "softcorr_applied", "softcorr_step_m"
+            "softcorr_applied", "softcorr_step_m",
+            "mavlink_sent", "mavlink_aligned"
         ])
         f.flush()
 
-        # Initialize MAVLink publisher before DepthAI device loop (so you see connection errors early)
-        odom_pub = MavlinkOdomPublisher(MAVLINK_DEVICE, MAVLINK_BAUD) if ENABLE_MAVLINK_ODOM else None
+        # MAVLink init first so you see errors early
+        vision_pub = MavlinkVisionPublisher(MAVLINK_DEVICE, MAVLINK_BAUD) if ENABLE_MAVLINK_VISION else None
 
         with dai.Device(pipeline) as device:
             calib = device.readCalibration()
@@ -759,9 +678,13 @@ def main():
                 vo.process(gray, depth_mm)
                 pos, yaw_vis = vo.pose()
 
-                # Send MAVLink ODOMETRY (only when tracking is good)
-                if odom_pub is not None and odom_pub.enabled and vo.status == "TRACKING":
-                    odom_pub.send_odometry(pos, yaw_vis)
+                # MAVLink send
+                mavlink_sent = 0
+                mavlink_aligned = 0
+                if vision_pub is not None and vision_pub.enabled and vo.status == "TRACKING":
+                    vision_pub.send_vision(pos, yaw_vis)
+                    mavlink_sent = 1
+                    mavlink_aligned = 1 if vision_pub.have_alignment else 0
 
                 # Loop + soft correction (on RGB)
                 loop_detected = 0
@@ -811,7 +734,9 @@ def main():
                         loop_score,
                         loop_drift_m,
                         softcorr_applied,
-                        softcorr_step_m
+                        softcorr_step_m,
+                        mavlink_sent,
+                        mavlink_aligned
                     ])
                     if int(t_sec) % 2 == 0:
                         f.flush()
@@ -825,7 +750,7 @@ def main():
                         if 0 <= u < W and 0 <= v < H:
                             cv2.circle(vis, (u, v), 2, (0, 255, 0), -1)
 
-                cv2.putText(vis, "VO: DepthAI Stereo + OpenCV LK (FAST) [RGB MAIN] + MAV ODOM", (10, 22),
+                cv2.putText(vis, "VO: DepthAI Stereo + OpenCV LK (FAST) [RGB MAIN] + MAV VISION", (10, 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 cv2.putText(vis, f"Status: {vo.status}", (10, 46),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
@@ -836,9 +761,9 @@ def main():
                 cv2.putText(vis, f"tracked={vo.num_tracked} pnp={vo.num_used_pnp} inliers={vo.inliers}", (10, 118),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-                if odom_pub is not None and odom_pub.enabled:
-                    align_txt = "aligned" if odom_pub.have_alignment else "aligning..."
-                    cv2.putText(vis, f"MAVLink ODOM: {align_txt}", (10, 142),
+                if vision_pub is not None and vision_pub.enabled:
+                    align_txt = "aligned" if vision_pub.have_alignment else "aligning..."
+                    cv2.putText(vis, f"MAVLink VISION: {align_txt}", (10, 142),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
                 if ENABLE_LOOP and loop is not None:
@@ -852,7 +777,7 @@ def main():
                             cv2.putText(vis, f"SoftCorr applied (alpha={SOFT_CORR_ALPHA}) step={softcorr_step_m}m",
                                         (10, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
 
-                cv2.imshow("VO + Loop + SoftCorr (FAST) - RGB MAIN + MAV ODOM", vis)
+                cv2.imshow("VO + Loop + SoftCorr (FAST) - RGB MAIN + MAV VISION", vis)
 
                 frame_id += 1
 
