@@ -1,38 +1,373 @@
-# To-Do Project Startup 
-OS:Windows  
-IDE: VSCode  
-Hardware: OAK-DS-2  
-Language: Pyhton  
+# 🚁 Visual Odometry + Loop Closure + MAVLink External Vision (DepthAI + Raspberry Pi 5)
 
+## 📌 Overview
 
+This project implements a **real-time visual odometry (VO) and lightweight SLAM system** using an **OAK-D-S2 stereo camera** and a **Raspberry Pi 5**, designed for **GPS-denied drone navigation**.
 
-Recommended Code order: test_vio_simple.py, vio_with_rgb.py, logging_VIO_only.py, plot_from_csv.py, Logging_VIO_SLAM_.py
+The system:
 
-1) Install Python, I am using version 3.12.10. It needs to be either python 3.12 or 3.11, spectacularAI is not supported in 3.13 or 3.14 at time of making this project. https://www.python.org/downloads/windows/  
-When installing ensure that you check the box that says include Python in Path 
-2) Enable Python extensions in VSCode. (Pylance, Python, Python debugger, Python Environments Optional: Python Extension Pack and Python Path)
-3) Create folder in file explorer that you are going to be using
-4) Open Folder from file tab in VSCode then navigate to your folder and open. It should be empty currently
-5) Once folder is open Create .py file, If using my names then just copy and paste, then fill with the code.
-6) Once in the files open new terminal, yuou can test python version with (python --version)
-7) Create Virtual enivronment py -m venv .venv, then choose the environment in VScode, ctrl+shift+p then type python select interpter and choose the venv, if it does not show close VScode and reopen
-then activate venv .\.venv\Scripts\activate
-if error cannot be loaded because running 
-scripts is disabled on this system. For more information, see about_Execution_Policies at 
-https:/go.microsoft.com/fwlink/?LinkID=135170.
+* Estimates **camera motion in 3D (x, y, z)** using stereo vision
+* Tracks visual features across frames using optical flow
+* Uses depth to recover **metric scale (meters)**
+* Solves camera motion using **Perspective-n-Point (PnP)**
+* Applies **loop closure detection** to reduce drift
+* Sends position to a Pixhawk flight controller using **MAVLink `VISION_POSITION_ESTIMATE`**
 
-then open powershell in windows, does not have to be admin and run Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+This allows integration with **ArduPilot EKF** for **external vision-based navigation**.
 
-8) Once we are in the .venv (should appear on the left of the path of terminal (.venv) PS C:\Users\Daniel\) install libraries
-python -m pip install -U pip  
-pip install depthai spectacularAI opencv-python rich (Optional upgrade pip is newer version is available, python.exe -m pip install --upgrade pip
-9) Once this is alldones go ahead and test the first program (test_vio_simple.py)
-**** Important **** OAK camera needs to have a good USB3.0 connection, if on USB 2.0 program may not open, and if it does open it will crash often and you will not be able to run adequately.
-10) Once program runs, move to the next code where we get the camera to work.
-11) Once we get to the logging code, we create the plot code to take the information gained from logging and plot.
-12) When we run the logging codes it is going to ask you to name your run so we can save multiple runs, when run is finished it will create a .csv file that will create a table with all of our information, this will be the x,y,z and time of our run.
-13) To get the plot code to run we need to install one more library python -m pip install matplotlib, once installed we can now run our plot code 
-python .\plot_from_csv.py .\whatever CSV filed was created after you named it in step 12, ex: .\plot_from_csv.py .\trajectory_test_2026-02-05_15-27-35.csv
-14) When we get to the logging_VIO_SLAM.py this code is mainly the VIO code with the SLAM code attached and we can alternate back and forth by having both methods or just the VIO  In the User settings in the code there is a function called USER_SLAM = xxxx, to enable slam convert to True, to disable convert to False.
-15) If Slam enabled, to ensure it is updating the Kfs and points, this can be seen in the camera window during test runs, but will also be displayed in the .csv created
-    
+---
+
+## 🧠 Core Idea (Theory)
+
+The system replaces GPS by estimating position using vision:
+
+1. Detect visual features in an image
+2. Track those features across frames
+3. Use stereo depth to convert pixels → 3D points
+4. Solve camera motion using PnP
+5. Accumulate motion over time → global position
+6. Detect revisited areas (loop closure)
+7. Correct accumulated drift
+8. Send position to Pixhawk via MAVLink
+
+---
+
+## 🧱 System Architecture
+
+```
+OAK-D-S2 Camera
+   ├── Left Mono (grayscale)
+   ├── Right Mono (depth)
+   ├── RGB (visualization + loop closure)
+   └── IMU (gyro only, display/logging)
+
+          ↓
+
+Raspberry Pi 5 (Python)
+   ├── Visual Odometry (LK + PnP)
+   ├── Loop Closure (ORB)
+   ├── Soft Drift Correction
+   └── MAVLink (External Vision)
+
+          ↓
+
+Pixhawk 6X (ArduPilot)
+   ├── EKF (sensor fusion)
+   ├── IMU + Barometer
+   └── External Vision Input
+
+          ↓
+
+Drone Navigation (No GPS)
+```
+
+---
+
+## ⚙️ Key Components
+
+### 1. Feature Detection & Tracking
+
+* Detects strong visual points (corners)
+* Tracks them across frames
+
+### 2. Depth-Based 3D Reconstruction
+
+* Uses stereo depth to convert 2D points → 3D coordinates (meters)
+
+### 3. Motion Estimation (PnP)
+
+* Solves camera movement between frames using 3D → 2D correspondences
+
+### 4. Pose Accumulation
+
+* Chains frame-to-frame motion into a continuous trajectory
+
+### 5. Loop Closure
+
+* Recognizes previously seen locations using ORB features
+* Estimates drift and corrects it
+
+### 6. MAVLink Integration
+
+* Sends position to Pixhawk using:
+
+```
+VISION_POSITION_ESTIMATE
+```
+
+---
+
+## 📦 Libraries Used
+
+| Library                           | Purpose                               |
+| --------------------------------- | ------------------------------------- |
+| `depthai`                         | Camera pipeline, stereo depth, IMU    |
+| `opencv-python (cv2)`             | Feature detection, tracking, PnP, ORB |
+| `numpy`                           | Matrix math, transformations          |
+| `pymavlink`                       | MAVLink communication with Pixhawk    |
+| `time`, `math`, `csv`, `datetime` | Logging, timing, math utilities       |
+
+---
+
+## 🔍 Key Functions and Their Roles
+
+---
+
+### 📷 DepthAI (Camera & Sensors)
+
+#### `dai.Pipeline()`
+
+* Creates a processing pipeline on the OAK device
+
+#### `dai.node.MonoCamera`
+
+* Left + right grayscale cameras for stereo depth
+
+#### `dai.node.StereoDepth`
+
+* Computes depth map from stereo pair
+
+#### `dai.node.ColorCamera`
+
+* RGB stream used for:
+
+  * visualization
+  * loop closure
+
+#### `dai.node.IMU`
+
+* Provides gyroscope data (used for yaw display only)
+
+---
+
+### 🧮 OpenCV (Core Vision Algorithms)
+
+#### `cv2.goodFeaturesToTrack()`
+
+* Detects strong corner features
+* These appear as **green dots** on screen
+* Used for tracking
+
+#### `cv2.calcOpticalFlowPyrLK()`
+
+* Tracks features between frames using Lucas-Kanade optical flow
+
+#### `cv2.solvePnPRansac()`
+
+* Solves for camera motion using:
+
+  * 3D points (from depth)
+  * 2D projections (current frame)
+* Returns rotation + translation
+
+#### `cv2.Rodrigues()`
+
+* Converts rotation vector → rotation matrix
+
+#### `cv2.ORB_create()`
+
+* Extracts descriptors for loop closure
+
+#### `cv2.BFMatcher()`
+
+* Matches ORB descriptors between frames
+
+#### `cv2.cvtColor()`
+
+* Converts RGB → grayscale
+
+---
+
+### 🧠 Visual Odometry Class (`VO_LK`)
+
+#### `process(gray, depth)`
+
+Core function that:
+
+* Tracks features
+* Builds 3D → 2D correspondences
+* Runs PnP
+* Updates pose
+
+#### `update_imu()`
+
+* Integrates gyro Z-axis
+* Used for **display only (NOT fused into pose)**
+
+#### `apply_soft_correction()`
+
+* Applies gradual drift correction after loop detection
+
+#### `pose()`
+
+* Returns current position and yaw
+
+---
+
+### 🔁 Loop Closure (`LoopClosureORB`)
+
+#### `add_keyframe()`
+
+* Stores:
+
+  * ORB descriptors
+  * pose
+  * frame ID
+
+#### `check_loop()`
+
+* Matches current frame against past keyframes
+* If match is strong:
+
+  * computes drift
+  * returns correction data
+
+---
+
+### 📡 MAVLink Integration (`MavlinkVisionPublisher`)
+
+#### `vision_position_estimate_send()`
+
+(from `pymavlink`)
+
+Sends:
+
+```
+position (x, y, z)
+orientation (roll, pitch, yaw)
+timestamp
+```
+
+#### `vo_pose_to_ned()`
+
+* Converts VO coordinates → NED frame (required by Pixhawk)
+
+#### `align_if_needed()`
+
+* Aligns VO heading with Pixhawk heading at startup
+
+---
+
+## 🟢 What the Green Dots Represent
+
+The green dots are:
+
+* Features detected using `cv2.goodFeaturesToTrack()`
+* Tracked across frames using optical flow
+
+They represent:
+
+* stable points in the environment
+* used for motion estimation
+
+More dots = better tracking
+Fewer dots = degraded pose estimation
+
+---
+
+## 📉 Drift & Correction
+
+### Drift Sources
+
+* noisy depth
+* imperfect tracking
+* PnP estimation errors
+
+### Correction Method
+
+* detect revisited locations (loop closure)
+* compute drift vector
+* apply small correction:
+
+```
+new_pose = current_pose + alpha * drift
+```
+
+---
+
+## 🧭 IMU Usage
+
+### Camera IMU (OAK-D)
+
+* Used for:
+
+  * yaw visualization
+  * logging
+* NOT used for pose estimation
+
+### Pixhawk IMU
+
+* Used inside ArduPilot EKF
+* Handles:
+
+  * stabilization
+  * orientation
+  * velocity estimation
+
+---
+
+## ❗ Important Note (External Vision)
+
+This code:
+✔ Sends position to Pixhawk
+❌ Does NOT force Pixhawk to use it
+
+To use external vision, ArduPilot must be configured:
+
+* EKF source set to **ExternalNav**
+* GPS disabled or deprioritized
+
+---
+
+## ▶️ How to Run
+
+```bash
+MAVLINK_DIALECT=ardupilotmega python3 vo_full.py
+```
+
+---
+
+## 📊 Output
+
+### Live Window Displays:
+
+* Position (x, y, z)
+* Yaw (vision vs IMU)
+* Feature points (green dots)
+* Loop closure events
+* Tracking status
+
+### CSV Log:
+
+* timestamp
+* position
+* tracking stats
+* loop closure data
+* correction info
+
+---
+
+## 🚀 Applications
+
+* GPS-denied UAV navigation
+* Indoor drone flight
+* Autonomous robotics
+* SLAM research
+* Vision-based localization
+
+---
+
+## 📌 Summary
+
+This system implements a **real-time, stereo-based visual odometry pipeline** with:
+
+* feature tracking
+* depth-based reconstruction
+* PnP motion estimation
+* loop closure correction
+* MAVLink external vision integration
+
+It provides a complete foundation for **autonomous navigation without GPS**.
+
+---
+
